@@ -1309,6 +1309,157 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
   }
 });
 
+// --- Roni bridge endpoint ----------------------------------------------------
+// Receives a message from the Chatwoot bridge and runs Roni (agent: main).
+
+app.post("/hooks/agent", async (req, res) => {
+  try {
+    // Authenticate the bridge using the existing OpenClaw gateway token.
+    const authHeader = String(req.headers.authorization || "");
+    const expectedAuth = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+
+    const supplied = Buffer.from(authHeader);
+    const expected = Buffer.from(expectedAuth);
+
+    const authOk =
+      supplied.length === expected.length &&
+      crypto.timingSafeEqual(supplied, expected);
+
+    if (!authOk) {
+      return res.status(401).json({
+        ok: false,
+        error: "Unauthorized",
+      });
+    }
+
+    // Read the message sent by the bridge.
+    const message = String(req.body?.message || "").trim();
+    const sessionId = String(req.body?.sessionId || "").trim();
+
+    if (!message) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing message",
+      });
+    }
+
+    // Basic protection against accidentally sending huge payloads.
+    if (message.length > 20000) {
+      return res.status(413).json({
+        ok: false,
+        error: "Message too large",
+      });
+    }
+
+    // sessionId is optional. Later we will use one session per Chatwoot conversation.
+    if (sessionId && !/^[A-Za-z0-9._:-]{1,200}$/.test(sessionId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid sessionId",
+      });
+    }
+
+    if (!isConfigured()) {
+      return res.status(503).json({
+        ok: false,
+        error: "OpenClaw is not configured",
+      });
+    }
+
+    // Make sure the OpenClaw gateway is running.
+    await ensureGatewayRunning();
+
+    // Equivalent to:
+    // openclaw agent --agent main --message "..." --json
+    const args = [
+      "agent",
+      "--agent",
+      "main",
+      "--message",
+      message,
+      "--json",
+    ];
+
+    if (sessionId) {
+      args.push("--session-id", sessionId);
+    }
+
+    const result = await runCmd(
+      OPENCLAW_NODE,
+      clawArgs(args),
+      { timeoutMs: 120000 },
+    );
+
+    if (result.code !== 0) {
+      console.error(
+        "[hooks/agent] OpenClaw agent failed:",
+        redactSecrets(result.output),
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "OpenClaw agent failed",
+        output: redactSecrets(result.output),
+      });
+    }
+
+    let parsed;
+
+    try {
+      parsed = JSON.parse(result.output);
+    } catch (err) {
+      console.error(
+        "[hooks/agent] Invalid JSON from OpenClaw:",
+        redactSecrets(result.output),
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "Invalid JSON returned by OpenClaw",
+        output: redactSecrets(result.output),
+      });
+    }
+
+    // Extract Roni's text reply from the OpenClaw JSON result.
+    const payloads = Array.isArray(parsed?.result?.payloads)
+      ? parsed.result.payloads
+      : [];
+
+    const reply = payloads
+      .map((payload) =>
+        typeof payload?.text === "string" ? payload.text : ""
+      )
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
+    if (!reply) {
+      return res.status(502).json({
+        ok: false,
+        error: "OpenClaw returned no text reply",
+      });
+    }
+
+    // Send a simple response back to the Chatwoot bridge.
+    return res.status(200).json({
+      ok: true,
+      reply,
+      runId: parsed?.runId || null,
+      sessionId:
+        parsed?.result?.meta?.agentMeta?.sessionId ||
+        sessionId ||
+        null,
+    });
+  } catch (err) {
+    console.error("[hooks/agent] error:", err);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Internal server error",
+    });
+  }
+});
+F
 // Proxy everything else to the gateway.
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
