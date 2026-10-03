@@ -1459,7 +1459,6 @@ app.post("/hooks/agent", async (req, res) => {
     });
   }
 });
-F
 // Proxy everything else to the gateway.
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
